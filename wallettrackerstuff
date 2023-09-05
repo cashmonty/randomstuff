@@ -1,0 +1,221 @@
+
+    # Simple demo that scans all the token transfers of RCC token (11k).
+    # The demo supports persistent state by using a JSON file.
+    # You will need an Ethereum node for this.
+    # Running this script will consume around 20k JSON-RPC calls.
+    # With locally running Geth, the script takes 10 minutes.
+    # The resulting JSON state file is 2.9 MB.
+    import sys
+    import json
+    from web3.providers.rpc import HTTPProvider
+
+    # We use tqdm library to render a nice progress bar in the console
+    # https://pypi.org/project/tqdm/
+    from tqdm import tqdm
+
+    # RCC has around 11k Transfer events
+    # https://etherscan.io/token/0x9b6443b0fb9c241a7fdac375595cea13e6b7807a
+    WETH_ADDRESS = "0x9b6443b0fb9c241a7fdac375595cea13e6b7807a"
+
+    # Reduced ERC-20 ABI, only Transfer event
+    ABI = """[
+        {
+            "anonymous": false,
+            "inputs": [
+                {
+                    "indexed": true,
+                    "name": "from",
+                    "type": "address"
+                },
+                {
+                    "indexed": true,
+                    "name": "to",
+                    "type": "address"
+                },
+                {
+                    "indexed": false,
+                    "name": "value",
+                    "type": "uint256"
+                }
+            ],
+            "name": "Transfer",
+            "type": "event"
+        }
+    ]
+    """
+
+    class JSONifiedState(EventScannerState):
+        """Store the state of scanned blocks and all events.
+
+        All state is an in-memory dict.
+        Simple load/store massive JSON on start up.
+        """
+
+        def __init__(self):
+            self.state = None
+            self.fname = "test-state.json"
+            # How many second ago we saved the JSON file
+            self.last_save = 0
+
+        def reset(self):
+            """Create initial state of nothing scanned."""
+            self.state = {
+                "last_scanned_block": 0,
+                "blocks": {},
+            }
+
+        def restore(self):
+            """Restore the last scan state from a file."""
+            try:
+                self.state = json.load(open(self.fname, "rt"))
+                print(f"Restored the state, previously {self.state['last_scanned_block']} blocks have been scanned")
+            except (IOError, json.decoder.JSONDecodeError):
+                print("State starting from scratch")
+                self.reset()
+
+        def save(self):
+            """Save everything we have scanned so far in a file."""
+            with open(self.fname, "wt") as f:
+                json.dump(self.state, f)
+            self.last_save = time.time()
+
+        #
+        # EventScannerState methods implemented below
+        #
+
+        def get_last_scanned_block(self):
+            """The number of the last block we have stored."""
+            return self.state["last_scanned_block"]
+
+        def delete_data(self, since_block):
+            """Remove potentially reorganised blocks from the scan data."""
+            for block_num in range(since_block, self.get_last_scanned_block()):
+                if block_num in self.state["blocks"]:
+                    del self.state["blocks"][block_num]
+
+        def start_chunk(self, block_number, chunk_size):
+            pass
+
+        def end_chunk(self, block_number):
+            """Save at the end of each block, so we can resume in the case of a crash or CTRL+C"""
+            # Next time the scanner is started we will resume from this block
+            self.state["last_scanned_block"] = block_number
+
+            # Save the database file for every minute
+            if time.time() - self.last_save > 60:
+                self.save()
+
+        def process_event(self, block_when: datetime.datetime, event: AttributeDict) -> str:
+            """Record a ERC-20 transfer in our database."""
+            # Events are keyed by their transaction hash and log index
+            # One transaction may contain multiple events
+            # and each one of those gets their own log index
+
+            # event_name = event.event # "Transfer"
+            log_index = event.logIndex  # Log index within the block
+            # transaction_index = event.transactionIndex  # Transaction index within the block
+            txhash = event.transactionHash.hex()  # Transaction hash
+            block_number = event.blockNumber
+
+            # Convert ERC-20 Transfer event to our internal format
+            args = event["args"]
+            transfer = {
+                "from": args["from"],
+                "to": args.to,
+                "value": args.value,
+                "timestamp": block_when.isoformat(),
+            }
+
+            # Create empty dict as the block that contains all transactions by txhash
+            if block_number not in self.state["blocks"]:
+                self.state["blocks"][block_number] = {}
+
+            block = self.state["blocks"][block_number]
+            if txhash not in block:
+                # We have not yet recorded any transfers in this transaction
+                # (One transaction may contain multiple events if executed by a smart contract).
+                # Create a tx entry that contains all events by a log index
+                self.state["blocks"][block_number][txhash] = {}
+
+            # Record ERC-20 transfer in our database
+            self.state["blocks"][block_number][txhash][log_index] = transfer
+
+            # Return a pointer that allows us to look up this event later if needed
+            return f"{block_number}-{txhash}-{log_index}"
+
+    def run():
+
+        if len(sys.argv) < 2:
+            print("Usage: eventscanner.py http://your-node-url")
+            sys.exit(1)
+
+        api_url = sys.argv[1]
+
+        # Enable logs to the stdout.
+        # DEBUG is very verbose level
+        logging.basicConfig(level=logging.INFO)
+
+        provider = HTTPProvider(api_url)
+
+        # Remove the default JSON-RPC retry middleware
+        # as it correctly cannot handle eth_getLogs block range
+        # throttle down.
+        provider.middlewares.clear()
+
+        w3 = Web3(provider)
+
+        # Prepare stub ERC-20 contract object
+        abi = json.loads(ABI)
+        ERC20 = w3.eth.contract(abi=abi)
+
+        # Restore/create our persistent state
+        state = JSONifiedState()
+        state.restore()
+
+        # chain_id: int, w3: Web3, abi: Dict, state: EventScannerState, events: List, filters: Dict, max_chunk_scan_size: int=10000
+        scanner = EventScanner(
+            w3=w3,
+            contract=ERC20,
+            state=state,
+            events=[ERC20.events.Transfer],
+            filters={"address": RCC_ADDRESS},
+            # How many maximum blocks at the time we request from JSON-RPC
+            # and we are unlikely to exceed the response size limit of the JSON-RPC server
+            max_chunk_scan_size=10000
+        )
+
+        # Assume we might have scanned the blocks all the way to the last Ethereum block
+        # that mined a few seconds before the previous scan run ended.
+        # Because there might have been a minor Ethereum chain reorganisations
+        # since the last scan ended, we need to discard
+        # the last few blocks from the previous scan results.
+        chain_reorg_safety_blocks = 10
+        scanner.delete_potentially_forked_block_data(state.get_last_scanned_block() - chain_reorg_safety_blocks)
+
+        # Scan from [last block scanned] - [latest ethereum block]
+        # Note that our chain reorg safety blocks cannot go negative
+        start_block = max(state.get_last_scanned_block() - chain_reorg_safety_blocks, 0)
+        end_block = scanner.get_suggested_scan_end_block()
+        blocks_to_scan = end_block - start_block
+
+        print(f"Scanning events from blocks {start_block} - {end_block}")
+
+        # Render a progress bar in the console
+        start = time.time()
+        with tqdm(total=blocks_to_scan) as progress_bar:
+            def _update_progress(start, end, current, current_block_timestamp, chunk_size, events_count):
+                if current_block_timestamp:
+                    formatted_time = current_block_timestamp.strftime("%d-%m-%Y")
+                else:
+                    formatted_time = "no block time available"
+                progress_bar.set_description(f"Current block: {current} ({formatted_time}), blocks in a scan batch: {chunk_size}, events processed in a batch {events_count}")
+                progress_bar.update(chunk_size)
+
+            # Run the scan
+            result, total_chunks_scanned = scanner.scan(start_block, end_block, progress_callback=_update_progress)
+
+        state.save()
+        duration = time.time() - start
+        print(f"Scanned total {len(result)} Transfer events, in {duration} seconds, total {total_chunks_scanned} chunk scans performed")
+
+    run()
